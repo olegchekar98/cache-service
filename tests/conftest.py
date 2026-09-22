@@ -11,10 +11,13 @@ os.environ["CACHE_SERVICE_DATABASE_URL"] = "sqlite://"
 os.environ["CACHE_SERVICE_TRANSFORMER_LATENCY_SECONDS"] = "0"
 
 import pytest
+from fastapi.testclient import TestClient
 from sqlmodel import Session, SQLModel, create_engine
 from sqlmodel.pool import StaticPool
 
 from cache_service import cache
+from cache_service.database import get_session
+from cache_service.main import app
 from cache_service.transformer import transform
 
 # The example from the task description, used across the suite.
@@ -47,6 +50,19 @@ def session() -> Iterator[Session]:
     with Session(engine) as session:
         yield session
     engine.dispose()
+
+
+@pytest.fixture
+def client(session: Session) -> Iterator[TestClient]:
+    """A client wired to the app over ASGI.
+
+    It subclasses httpx.Client, so it also stands in for the CLI's HTTP client
+    and lets the CLI be exercised end to end without a running server.
+    """
+    app.dependency_overrides[get_session] = lambda: session
+    with TestClient(app) as test_client:
+        yield test_client
+    app.dependency_overrides.clear()
 
 
 @pytest.fixture
