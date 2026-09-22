@@ -17,6 +17,23 @@ from sqlmodel.pool import StaticPool
 from cache_service import cache
 from cache_service.transformer import transform
 
+# The example from the task description, used across the suite.
+SAMPLE_LIST_1 = ["first string", "second string", "third string"]
+SAMPLE_LIST_2 = ["other string", "another string", "last string"]
+SAMPLE_OUTPUT = (
+    "FIRST STRING, OTHER STRING, SECOND STRING, ANOTHER STRING, THIRD STRING, LAST STRING"
+)
+
+
+@pytest.fixture
+def sample_request() -> dict[str, list[str]]:
+    return {"list_1": SAMPLE_LIST_1, "list_2": SAMPLE_LIST_2}
+
+
+@pytest.fixture
+def sample_output() -> str:
+    return SAMPLE_OUTPUT
+
 
 @pytest.fixture
 def session() -> Iterator[Session]:
