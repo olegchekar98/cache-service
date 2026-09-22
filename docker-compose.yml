@@ -1,0 +1,36 @@
+services:
+  cache-service:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      # Defaults to the SQLite file on the volume below; override to use PostgreSQL:
+      # CACHE_SERVICE_DATABASE_URL=postgresql+psycopg://cache:cache@postgres:5432/cache
+      CACHE_SERVICE_DATABASE_URL: ${CACHE_SERVICE_DATABASE_URL:-sqlite:////data/cache_service.db}
+      CACHE_SERVICE_TRANSFORMER_LATENCY_SECONDS: ${CACHE_SERVICE_TRANSFORMER_LATENCY_SECONDS:-0}
+    volumes:
+      - cache-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: false
+
+  # Started only with `--profile postgres`; the service runs on SQLite by default.
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_USER: cache
+      POSTGRES_PASSWORD: cache
+      POSTGRES_DB: cache
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cache"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+volumes:
+  cache-data:
+  postgres-data:
