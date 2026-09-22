@@ -1,11 +1,18 @@
 """Database engine and session handling."""
 
+import logging
+import time
 from collections.abc import Generator
 
 from sqlalchemy import Engine
+from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, SQLModel, create_engine
 
 from cache_service.config import settings
+
+logger = logging.getLogger(__name__)
+
+_RETRY_INTERVAL_SECONDS = 0.5
 
 
 def _build_engine(url: str) -> Engine:
@@ -19,12 +26,21 @@ engine = _build_engine(settings.database_url)
 
 
 def init_db() -> None:
-    """Create missing tables.
+    """Create missing tables, waiting for the database to become reachable.
 
-    Adequate for a service with an append-only schema; a deployment that needs
-    to evolve the schema would replace this with Alembic migrations.
+    Creating tables on startup is adequate for an append-only schema; a
+    deployment that needs to evolve the schema would use Alembic migrations.
     """
-    SQLModel.metadata.create_all(engine)
+    deadline = time.monotonic() + settings.database_startup_timeout_seconds
+    while True:
+        try:
+            SQLModel.metadata.create_all(engine)
+            return
+        except OperationalError:
+            if time.monotonic() >= deadline:
+                raise
+            logger.warning("database is not reachable yet, retrying")
+            time.sleep(_RETRY_INTERVAL_SECONDS)
 
 
 def get_session() -> Generator[Session, None, None]:

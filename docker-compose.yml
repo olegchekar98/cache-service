@@ -10,12 +10,9 @@ services:
       CACHE_SERVICE_TRANSFORMER_LATENCY_SECONDS: ${CACHE_SERVICE_TRANSFORMER_LATENCY_SECONDS:-0}
     volumes:
       - cache-data:/data
-    depends_on:
-      postgres:
-        condition: service_healthy
-        required: false
 
   # Started only with `--profile postgres`; the service runs on SQLite by default.
+  # No depends_on is needed: the service waits for its database on startup.
   postgres:
     image: postgres:16-alpine
     profiles: ["postgres"]

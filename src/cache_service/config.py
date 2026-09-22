@@ -12,6 +12,9 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./cache_service.db"
     log_level: str = "INFO"
 
+    # Containers regularly start before their database accepts connections.
+    database_startup_timeout_seconds: float = Field(default=10.0, ge=0)
+
     # The transformer stands in for a remote service. An artificial delay makes the
     # effect of the cache measurable without depending on anything external.
     transformer_latency_seconds: float = Field(default=0.0, ge=0.0)

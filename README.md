@@ -145,6 +145,7 @@ Exit codes: `0` success, `1` the request failed, `2` invalid arguments or input.
 |----------|---------|-------------|
 | `CACHE_SERVICE_DATABASE_URL` | `sqlite:///./cache_service.db` | SQLAlchemy database URL |
 | `CACHE_SERVICE_LOG_LEVEL` | `INFO` | Root log level |
+| `CACHE_SERVICE_DATABASE_STARTUP_TIMEOUT_SECONDS` | `10` | How long to wait at startup for the database to accept connections |
 | `CACHE_SERVICE_TRANSFORMER_LATENCY_SECONDS` | `0` | Artificial delay per transformer call |
 
 ## Development
@@ -172,6 +173,8 @@ the transformer, so the caching requirements are asserted directly rather than i
 - **Concurrent duplicates are resolved by the database.** Both writes are guarded by unique
   constraints; a loser of the race rolls back and adopts the committed row rather than
   failing the request. This is simpler and more portable than dialect-specific upserts.
+- **Startup waits for the database** rather than relying on container ordering, so the
+  PostgreSQL profile works without a `depends_on` health gate.
 - **Endpoints are synchronous** because the database layer is synchronous. FastAPI runs them
   in a worker thread, which avoids blocking the event loop on database I/O.
 - **Shortcuts taken,** reasonable for an exercise but worth flagging for production:
