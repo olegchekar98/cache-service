@@ -2,11 +2,20 @@ import io
 import json
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from cache_service.cli import EXIT_USAGE, CLISettings, main, run
+from cache_service.cli import (
+    EXIT_FAILURE,
+    EXIT_OK,
+    EXIT_USAGE,
+    CLISettings,
+    main,
+    run,
+    run_from_command_line,
+)
 
 
 def settings_from(argv: list[str]) -> CLISettings:
@@ -74,6 +83,12 @@ def test_rejects_an_invalid_request_body() -> None:
         settings.read_request()
 
 
+def test_writes_the_report_to_stdout_by_default(capsys: pytest.CaptureFixture[str]) -> None:
+    settings_from(["-j", "{}"]).write_output('{"output": "A"}')
+
+    assert capsys.readouterr().out == '{"output": "A"}\n'
+
+
 def test_writes_the_report_to_a_file(tmp_path: Path) -> None:
     output_file = tmp_path / "report.json"
 
@@ -115,3 +130,51 @@ def test_main_reports_usage_errors_without_a_traceback(
 
     assert exit_info.value.code == EXIT_USAGE
     assert "exactly one of --input or --json" in capsys.readouterr().err
+
+
+def test_writes_the_report_on_success(
+    monkeypatch: pytest.MonkeyPatch,
+    client: TestClient,
+    tmp_path: Path,
+    sample_request: dict[str, list[str]],
+    sample_output: str,
+) -> None:
+    report_file = tmp_path / "report.json"
+    monkeypatch.setattr(
+        "sys.argv", ["cache-cli", "-j", json.dumps(sample_request), "-o", str(report_file)]
+    )
+
+    assert run_from_command_line(client) == EXIT_OK
+    assert json.loads(report_file.read_text(encoding="utf-8"))["output"] == sample_output
+
+
+def test_reports_an_error_response_from_the_server(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    sample_request: dict[str, list[str]],
+) -> None:
+    unavailable = httpx.MockTransport(lambda _: httpx.Response(503, text="unavailable"))
+    monkeypatch.setattr("sys.argv", ["cache-cli", "-j", json.dumps(sample_request)])
+
+    with httpx.Client(transport=unavailable, base_url="http://cache.test") as client:
+        assert run_from_command_line(client) == EXIT_FAILURE
+
+    assert "server returned 503" in capsys.readouterr().err
+
+
+def test_reports_an_unreachable_server(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    sample_request: dict[str, list[str]],
+) -> None:
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    monkeypatch.setattr("sys.argv", ["cache-cli", "-j", json.dumps(sample_request)])
+
+    with httpx.Client(
+        transport=httpx.MockTransport(refuse), base_url="http://cache.test"
+    ) as client:
+        assert run_from_command_line(client) == EXIT_FAILURE
+
+    assert "connection refused" in capsys.readouterr().err

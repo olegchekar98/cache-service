@@ -107,8 +107,34 @@ def run(settings: CLISettings, client: httpx.Client | None = None) -> RunReport:
     return RunReport(host=str(settings.host), iterations=list(iterations), output=outputs[-1])
 
 
+def run_from_command_line(client: httpx.Client | None = None) -> int:
+    """Run one invocation from ``sys.argv`` and return the process exit code."""
+    try:
+        settings = CLISettings()
+    except ValidationError as error:
+        return _fail(_describe(error), EXIT_USAGE)
+
+    try:
+        report = run(settings, client)
+    except ValidationError as error:
+        # Covers malformed JSON as well: Pydantic reports it as a validation error.
+        return _fail(f"invalid request body: {_describe(error)}", EXIT_USAGE)
+    except OSError as error:
+        return _fail(f"cannot read input: {error}", EXIT_USAGE)
+    except httpx.HTTPStatusError as error:
+        return _fail(f"server returned {error.response.status_code}: {error.response.text}")
+    except httpx.HTTPError as error:
+        return _fail(f"request to {settings.host} failed: {error}")
+
+    try:
+        settings.write_output(report.model_dump_json(indent=2))
+    except OSError as error:
+        return _fail(f"cannot write output: {error}")
+    return EXIT_OK
+
+
 def main() -> None:
-    raise SystemExit(_run_from_command_line())
+    raise SystemExit(run_from_command_line())
 
 
 def _create_and_read(
@@ -139,31 +165,6 @@ def _http_client(settings: CLISettings, client: httpx.Client | None) -> Iterator
         return
     with httpx.Client(base_url=str(settings.host), timeout=settings.timeout) as owned:
         yield owned
-
-
-def _run_from_command_line() -> int:
-    try:
-        settings = CLISettings()
-    except ValidationError as error:
-        return _fail(_describe(error), EXIT_USAGE)
-
-    try:
-        report = run(settings)
-    except ValidationError as error:
-        # Covers malformed JSON as well: Pydantic reports it as a validation error.
-        return _fail(f"invalid request body: {_describe(error)}", EXIT_USAGE)
-    except OSError as error:
-        return _fail(f"cannot read input: {error}", EXIT_USAGE)
-    except httpx.HTTPStatusError as error:
-        return _fail(f"server returned {error.response.status_code}: {error.response.text}")
-    except httpx.HTTPError as error:
-        return _fail(f"request to {settings.host} failed: {error}")
-
-    try:
-        settings.write_output(report.model_dump_json(indent=2))
-    except OSError as error:
-        return _fail(f"cannot write output: {error}")
-    return EXIT_OK
 
 
 def _describe(error: ValidationError) -> str:
