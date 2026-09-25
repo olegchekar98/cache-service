@@ -4,9 +4,11 @@ import os
 from typing import Any, cast
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.pool import NullPool
 from sqlmodel import SQLModel
 
 from cache_service import database
@@ -92,6 +94,28 @@ async def test_an_unresponsive_database_fails_the_check_quickly(
     assert record.levelno == logging.WARNING
     assert record.getMessage() == "readiness check failed: TimeoutError"
     assert record.exc_info is None, "a repeated health check must not log a traceback"
+
+
+@requires_server_database
+async def test_a_pooled_connection_closed_by_the_server_is_replaced() -> None:
+    """After a database restart, the first request must not fail on a stale connection."""
+    engine = build_engine(os.environ["CACHE_SERVICE_TEST_DATABASE_URL"], pool_size=1)
+    async with engine.connect() as connection:
+        pid = (await connection.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+
+    killer = build_engine(os.environ["CACHE_SERVICE_TEST_DATABASE_URL"], poolclass=NullPool)
+    async with killer.connect() as connection:
+        await connection.execute(text("SELECT pg_terminate_backend(:pid)"), {"pid": pid})
+        # Termination is a signal; wait until the backend is actually gone.
+        alive = text("SELECT count(*) FROM pg_stat_activity WHERE pid = :pid")
+        async with asyncio.timeout(5):
+            while (await connection.execute(alive, {"pid": pid})).scalar_one():
+                await asyncio.sleep(0.01)
+    await killer.dispose()
+
+    async with engine.connect() as connection:
+        assert (await connection.execute(text("SELECT 1"))).scalar_one() == 1
+    await engine.dispose()
 
 
 @requires_server_database

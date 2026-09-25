@@ -44,6 +44,10 @@ def build_engine(url: str, **options: Any) -> AsyncEngine:
     # would make savepoints nest as on PostgreSQL, but every request reads before
     # it writes, and SQLite fails such a read-to-write upgrade under contention
     # with "database is locked" instead of waiting for the lock.
+    #
+    # Pre-ping replaces pooled connections the server has closed, for example after a
+    # database restart, instead of failing the first request that checks one out.
+    options.setdefault("pool_pre_ping", True)
     return create_async_engine(url, **options)
 
 
