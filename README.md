@@ -2,8 +2,8 @@
 
 A FastAPI microservice that builds a payload by interleaving two lists of strings after
 passing each string through a "transformer" (a stand-in for an external service). Both the
-transformer results and the generated payloads are cached in a relational database, so the
-transformer is called at most once per distinct string, ever.
+transformer results and the generated payloads are cached in a relational database, so a
+string already stored in `transform_cache` is never sent to the transformer again.
 
 ## How it works
 
@@ -167,12 +167,19 @@ the transformer, so the caching requirements are asserted directly rather than i
 - **Payload identity is content-based.** The identifier is a UUID, but it is looked up by a
   digest of the inputs, so the same request always maps to the same identifier. Digests are
   stored instead of raw strings as keys, which keeps index entries small and bounded.
-- **The transformer cache is committed before the payload.** Transformer results are the
-  expensive artefact; committing them separately means they survive a later failure and
-  become visible to concurrent requests immediately.
+- **Cache writes use a savepoint, not `session.commit()`.** The cache shares the request's
+  session, so a unique conflict must roll back only the cache insert; `session.rollback()`
+  would also discard the caller's pending payload work. When the savepoint commits
+  differs by database: on PostgreSQL the cache rows commit together with the payload, but
+  on SQLite the `pysqlite` driver only opens a transaction at the first write, so releasing
+  the savepoint commits the cache rows immediately. See the known limitations below.
 - **Concurrent duplicates are resolved by the database.** Both writes are guarded by unique
-  constraints; a loser of the race rolls back and adopts the committed row rather than
-  failing the request. This is simpler and more portable than dialect-specific upserts.
+  constraints. A loser of a payload race rolls back and adopts the committed identifier.
+  A loser of a cache race re-reads the winner's rows and inserts only the values that are
+  still missing, without calling the transformer again for them.
+- **The app owns the engine.** `create_app(engine=...)` stores it on `app.state`, so the
+  lifespan and `get_session` use the same database. Tests pass their engine in rather than
+  patching `get_session` around a module-level engine created at import time.
 - **Startup waits for the database** rather than relying on container ordering, so the
   PostgreSQL profile works without a `depends_on` health gate.
 - **Endpoints are synchronous** because the database layer is synchronous. FastAPI runs them
@@ -182,6 +189,17 @@ the transformer, so the caching requirements are asserted directly rather than i
   - Cache entries never expire; the transformer is assumed to be pure and stable. A real
     deployment would version the cache key with the transformer's version.
   - There is no authentication, rate limiting, or pagination over stored payloads.
+- **Known limitations,** found by testing and not yet fixed:
+  - Concurrent requests that miss the same string each call the transformer: the cache
+    stays correct, but the calls are duplicated. With 32 parallel clients sending 200
+    requests over 30 distinct strings, the transformer was called 160 times. A
+    single-flight guard around the transformer call would fix this.
+  - The transformer is called while the request's database transaction is open. With a
+    slow remote service, that holds a pooled connection for the duration of the call.
+  - The savepoint's commit timing differs between SQLite and PostgreSQL (see above).
+    SQLAlchemy documents a `pysqlite` workaround that makes SQLite match.
+  - Tests run on a single in-memory SQLite connection, so they cannot observe transaction
+    isolation, and PostgreSQL is not covered by the suite.
 - **Two ambiguities in the specification** were resolved as follows:
   - `-h` cannot mean both `--host` and `--help`; it is left as `--help` (the convention
     every CLI user expects), so `--host` has no short form.

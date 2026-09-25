@@ -21,11 +21,11 @@ def transform_all(session: Session, values: Sequence[str]) -> dict[str, str]:
     """Return the transformed text for every value, keyed by the original string.
 
     The transformer is called once per distinct value that is not already
-    cached; repeated and previously seen values are served from the database.
+    stored. Writes go through a savepoint so a unique conflict rolls back only
+    the cache insert, not the caller's payload transaction.
     """
     digests = {value: digest_text(value) for value in dict.fromkeys(values)}
     results = _load_cached(session, digests)
-
     missing = [value for value in digests if value not in results]
     if missing:
         results.update(_transform_and_cache(session, missing, digests))
@@ -46,22 +46,49 @@ def _load_cached(session: Session, digests: dict[str, str]) -> dict[str, str]:
 def _transform_and_cache(
     session: Session, values: Sequence[str], digests: dict[str, str]
 ) -> dict[str, str]:
-    transformed = {value: transform(value) for value in values}
-    session.add_all(
-        TransformCache(source_digest=digests[value], source=value, transformed=result)
-        for value, result in transformed.items()
-    )
-    try:
-        # Committed on its own, ahead of the payload, so that expensive transformer
-        # results are kept even if payload creation later fails.
-        session.commit()
-    except IntegrityError:
-        # A concurrent request cached at least one of these values first. Its rows
-        # are equivalent, so the results are still correct; the ones that did not
-        # conflict are simply recomputed on a future request.
-        session.rollback()
-        logger.debug("transform cache write raced with a concurrent request")
-    return transformed
+    """Persist transformer results, retrying only the rows that are still missing.
+
+    A concurrent writer may have stored a subset of this batch. After a unique
+    conflict the savepoint is rolled back, the winner's rows are re-read, and
+    only the leftovers are inserted — without calling the transformer again.
+    """
+    results: dict[str, str] = {}
+    pending = list(values)
+
+    while pending:
+        for value in pending:
+            if value not in results:
+                results[value] = transform(value)
+
+        try:
+            # begin_nested is a SAVEPOINT: failure here must not session.rollback()
+            # the caller's payload work sitting in the same session. flush(rows)
+            # is required so autoflush does not write those pending caller objects
+            # into this savepoint and then drop them on rollback.
+            rows = [
+                TransformCache(
+                    source_digest=digests[value],
+                    source=value,
+                    transformed=results[value],
+                )
+                for value in pending
+            ]
+            with session.begin_nested():
+                session.add_all(rows)
+                session.flush(rows)
+        except IntegrityError:
+            cached = _load_cached(session, {value: digests[value] for value in pending})
+            remaining = [value for value in pending if value not in cached]
+            if len(remaining) == len(pending):
+                # The conflict was not one of our keys; retrying would loop forever.
+                raise
+            results.update(cached)
+            pending = remaining
+            logger.debug("transform cache raced; %d values still unstored", len(pending))
+            continue
+        break
+
+    return results
 
 
 def _chunked(values: list[str], size: int) -> Iterator[list[str]]:
