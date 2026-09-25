@@ -1,4 +1,10 @@
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import Engine
+
+
+def test_create_app_uses_the_engine_it_was_given(app: FastAPI, engine: Engine) -> None:
+    assert app.state.engine is engine
 
 
 def test_health(client: TestClient) -> None:

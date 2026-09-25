@@ -1,24 +1,31 @@
 """Shared fixtures.
 
-The database URL is pinned before the application is imported: the engine is
-created at import time, and tests must never touch a real database file.
+Tests pass their engine into ``create_app``, so lifespan, handlers and the
+transformer cache all use the same bind. StaticPool keeps every connection on
+one in-memory database, which FastAPI's worker threads need for SQLite.
 """
 
 import os
 from collections.abc import Iterator
 
+# Force these: setdefault would keep a developer shell's non-zero transformer delay
+# and make the large-batch test look hung (1000 * 200ms).
 os.environ["CACHE_SERVICE_DATABASE_URL"] = "sqlite://"
 os.environ["CACHE_SERVICE_TRANSFORMER_LATENCY_SECONDS"] = "0"
 
 import pytest
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import Engine
 from sqlmodel import Session, SQLModel, create_engine
 from sqlmodel.pool import StaticPool
 
 from cache_service import cache
-from cache_service.database import get_session
-from cache_service.main import app
+from cache_service.config import settings
+from cache_service.main import create_app
 from cache_service.transformer import transform
+
+settings.transformer_latency_seconds = 0.0
 
 # The example from the task description, used across the suite.
 SAMPLE_LIST_1 = ["first string", "second string", "third string"]
@@ -39,30 +46,37 @@ def sample_output() -> str:
 
 
 @pytest.fixture
-def session() -> Iterator[Session]:
-    """A session on an empty in-memory database, shared by every connection."""
+def engine() -> Iterator[Engine]:
     engine = create_engine(
         "sqlite://",
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
     SQLModel.metadata.create_all(engine)
-    with Session(engine) as session:
-        yield session
+    yield engine
     engine.dispose()
 
 
 @pytest.fixture
-def client(session: Session) -> Iterator[TestClient]:
+def session(engine: Engine) -> Iterator[Session]:
+    with Session(engine) as session:
+        yield session
+
+
+@pytest.fixture
+def app(engine: Engine) -> FastAPI:
+    return create_app(engine=engine)
+
+
+@pytest.fixture
+def client(app: FastAPI) -> Iterator[TestClient]:
     """A client wired to the app over ASGI.
 
     It subclasses httpx.Client, so it also stands in for the CLI's HTTP client
     and lets the CLI be exercised end to end without a running server.
     """
-    app.dependency_overrides[get_session] = lambda: session
     with TestClient(app) as test_client:
         yield test_client
-    app.dependency_overrides.clear()
 
 
 @pytest.fixture

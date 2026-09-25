@@ -1,3 +1,5 @@
+from unittest.mock import MagicMock
+
 import pytest
 from sqlalchemy.exc import OperationalError
 from sqlmodel import SQLModel
@@ -20,7 +22,7 @@ def test_init_db_waits_for_an_unreachable_database(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(SQLModel.metadata, "create_all", fail_once)
 
-    database.init_db()
+    database.init_db(MagicMock())
 
     assert attempts == 2
 
@@ -34,4 +36,4 @@ def test_init_db_gives_up_once_the_timeout_passes(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(SQLModel.metadata, "create_all", always_fail)
 
     with pytest.raises(OperationalError):
-        database.init_db()
+        database.init_db(MagicMock())
