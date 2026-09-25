@@ -1,21 +1,16 @@
 """Shared fixtures.
 
-Tests pass their engine into ``create_app``, so lifespan, handlers and the
-transformer cache all use the same bind. StaticPool keeps every connection on
-one in-memory database.
+Tests build the app from their own ``Settings`` and engine, so nothing depends
+on the developer's environment or on objects created at import time.
 
-The API client runs the app on its own event loop, so API tests let the app's
-lifespan create the tables; ``session`` creates them on the test's loop instead.
+The suite runs on in-memory SQLite, or on ``CACHE_SERVICE_TEST_DATABASE_URL``
+when set. The API client runs the app on its own event loop, so API tests let
+the app's lifespan create the tables; ``session`` creates them on the test's loop.
 """
 
 import asyncio
 import os
 from collections.abc import AsyncIterator, Iterator
-
-# Force these: setdefault would keep a developer shell's non-zero transformer delay
-# and make the large-batch test look hung.
-os.environ["CACHE_SERVICE_DATABASE_URL"] = "sqlite+aiosqlite://"
-os.environ["CACHE_SERVICE_TRANSFORMER_LATENCY_SECONDS"] = "0"
 
 import pytest
 from fastapi import FastAPI
@@ -26,13 +21,18 @@ from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlmodel.pool import StaticPool
 
-from cache_service import cache
-from cache_service.config import settings
+from cache_service import transformer as transformer_module
+from cache_service.config import Settings
 from cache_service.database import build_engine
 from cache_service.main import create_app
-from cache_service.transformer import transform
+from cache_service.transformer import TransformerClient
 
-settings.transformer_latency_seconds = 0.0
+SERVER_DATABASE_URL = os.environ.get("CACHE_SERVICE_TEST_DATABASE_URL")
+
+requires_server_database = pytest.mark.skipif(
+    SERVER_DATABASE_URL is None,
+    reason="needs CACHE_SERVICE_TEST_DATABASE_URL: in-memory SQLite has a single connection",
+)
 
 # The example from the task description, used across the suite.
 SAMPLE_LIST_1 = ["first string", "second string", "third string"]
@@ -53,16 +53,25 @@ def sample_output() -> str:
 
 
 @pytest.fixture
-def engine() -> AsyncEngine:
-    """An in-memory SQLite engine, or ``CACHE_SERVICE_TEST_DATABASE_URL`` when set.
+def settings() -> Settings:
+    return Settings(  # type: ignore[call-arg]  # _env_file is a pydantic-settings hook
+        _env_file=None,
+        database_url="sqlite+aiosqlite://",
+        transformer_latency_seconds=0,
+        transformer_max_concurrency=10,
+    )
 
-    A server database is reset per test. NullPool keeps connections from being
-    shared between the event loops of the test and of the API client.
+
+@pytest.fixture
+def engine() -> AsyncEngine:
+    """An in-memory SQLite engine, or the server database, reset for this test.
+
+    NullPool keeps server connections from being shared between the event loops
+    of the test and of the API client.
     """
-    url = os.environ.get("CACHE_SERVICE_TEST_DATABASE_URL")
-    if url is None:
+    if SERVER_DATABASE_URL is None:
         return build_engine("sqlite+aiosqlite://", poolclass=StaticPool)
-    engine = build_engine(url, poolclass=NullPool)
+    engine = build_engine(SERVER_DATABASE_URL, poolclass=NullPool)
     asyncio.run(_reset_schema(engine))
     return engine
 
@@ -83,8 +92,13 @@ async def session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
 
 
 @pytest.fixture
-def app(engine: AsyncEngine) -> FastAPI:
-    return create_app(engine=engine)
+def transformer() -> TransformerClient:
+    return TransformerClient(max_concurrency=10)
+
+
+@pytest.fixture
+def app(settings: Settings, engine: AsyncEngine) -> FastAPI:
+    return create_app(settings, engine)
 
 
 @pytest.fixture
@@ -100,12 +114,13 @@ def client(app: FastAPI) -> Iterator[TestClient]:
 
 @pytest.fixture
 def transformer_calls(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Record every transformer invocation so cache behaviour can be asserted."""
+    """Record every call that reaches the transformer service."""
     calls: list[str] = []
+    transform = transformer_module.transform
 
-    async def recording_transform(value: str) -> str:
+    async def recording_transform(value: str, latency_seconds: float = 0.0) -> str:
         calls.append(value)
-        return await transform(value)
+        return await transform(value, latency_seconds)
 
-    monkeypatch.setattr(cache, "transform", recording_transform)
+    monkeypatch.setattr(transformer_module, "transform", recording_transform)
     return calls

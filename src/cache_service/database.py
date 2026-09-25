@@ -11,12 +11,11 @@ from collections.abc import AsyncGenerator
 from typing import Any
 
 from fastapi import Request
-from sqlalchemy.exc import OperationalError
+from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
-
-from cache_service.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -31,13 +30,13 @@ def build_engine(url: str, **options: Any) -> AsyncEngine:
     return create_async_engine(url, **options)
 
 
-async def init_db(engine: AsyncEngine) -> None:
-    """Create missing tables, waiting for the database to become reachable.
+async def init_db(engine: AsyncEngine, timeout_seconds: float) -> None:
+    """Create missing tables, waiting up to ``timeout_seconds`` for the database.
 
     Creating tables on startup is adequate for an append-only schema; a
     deployment that needs to evolve the schema would use Alembic migrations.
     """
-    deadline = time.monotonic() + settings.database_startup_timeout_seconds
+    deadline = time.monotonic() + timeout_seconds
     while True:
         try:
             async with engine.begin() as connection:
@@ -49,6 +48,16 @@ async def init_db(engine: AsyncEngine) -> None:
                 raise
             logger.warning("database is not reachable yet, retrying")
             await sleep(_RETRY_INTERVAL_SECONDS)
+
+
+async def is_reachable(engine: AsyncEngine) -> bool:
+    try:
+        async with engine.connect() as connection:
+            await connection.execute(text("SELECT 1"))
+    except (DBAPIError, OSError):
+        logger.warning("readiness check could not reach the database", exc_info=True)
+        return False
+    return True
 
 
 async def get_session(request: Request) -> AsyncGenerator[AsyncSession, None]:

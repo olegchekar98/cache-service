@@ -8,9 +8,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from cache_service.cache import transform_all
+from cache_service.cache import load_cached, store
 from cache_service.hashing import digest_lists
 from cache_service.models import Payload
+from cache_service.transformer import TransformerClient
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +19,10 @@ SEPARATOR = ", "
 
 
 async def get_or_create_payload(
-    session: AsyncSession, list_1: Sequence[str], list_2: Sequence[str]
+    session: AsyncSession,
+    transformer: TransformerClient,
+    list_1: Sequence[str],
+    list_2: Sequence[str],
 ) -> tuple[Payload, bool]:
     """Return the payload for the given lists, and whether it was newly created.
 
@@ -30,12 +34,22 @@ async def get_or_create_payload(
     if existing is not None:
         return existing, False
 
+    interleaved = [value for pair in zip(list_1, list_2, strict=True) for value in pair]
+    texts = await load_cached(session, interleaved)
+    # Nothing has been written yet. Ending the read-only transaction returns the
+    # connection to the pool, instead of holding it idle while the transformer runs.
+    await session.commit()
+
+    missing = [value for value in dict.fromkeys(interleaved) if value not in texts]
+    if missing:
+        texts |= await store(session, await transformer.transform_many(missing))
+
     payload = Payload(
         id=str(uuid.uuid4()),
         content_digest=content_digest,
         list_1=list(list_1),
         list_2=list(list_2),
-        output=await _render(session, list_1, list_2),
+        output=SEPARATOR.join(texts[value] for value in interleaved),
     )
     session.add(payload)
     try:
@@ -55,13 +69,6 @@ async def get_or_create_payload(
 
 async def get_payload(session: AsyncSession, payload_id: str) -> Payload | None:
     return await session.get(Payload, payload_id)
-
-
-async def _render(session: AsyncSession, list_1: Sequence[str], list_2: Sequence[str]) -> str:
-    """Interleave the two lists after transforming every string exactly once."""
-    interleaved = [value for pair in zip(list_1, list_2, strict=True) for value in pair]
-    transformed = await transform_all(session, interleaved)
-    return SEPARATOR.join(transformed[value] for value in interleaved)
 
 
 async def _find_by_digest(session: AsyncSession, content_digest: str) -> Payload | None:

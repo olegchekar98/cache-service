@@ -2,10 +2,10 @@
 
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from cache_service.database import get_session
+from cache_service.database import get_session, is_reachable
 from cache_service.payloads import get_or_create_payload, get_payload
 from cache_service.schemas import (
     HealthResponse,
@@ -13,14 +13,36 @@ from cache_service.schemas import (
     PayloadCreateResponse,
     PayloadReadResponse,
 )
+from cache_service.transformer import TransformerClient
+
+
+def get_transformer(request: Request) -> TransformerClient:
+    transformer: TransformerClient = request.app.state.transformer
+    return transformer
+
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
+TransformerDep = Annotated[TransformerClient, Depends(get_transformer)]
 
 router = APIRouter()
 
 
 @router.get("/health", response_model=HealthResponse, tags=["health"])
 async def health() -> HealthResponse:
+    """Liveness: the process is serving requests."""
+    return HealthResponse(status="ok")
+
+
+@router.get(
+    "/ready",
+    response_model=HealthResponse,
+    responses={status.HTTP_503_SERVICE_UNAVAILABLE: {"description": "Database unreachable"}},
+    tags=["health"],
+)
+async def ready(request: Request) -> HealthResponse:
+    """Readiness: the database accepts connections."""
+    if not await is_reachable(request.app.state.engine):
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database unreachable")
     return HealthResponse(status="ok")
 
 
@@ -32,9 +54,14 @@ async def health() -> HealthResponse:
     tags=["payload"],
 )
 async def create_payload(
-    request: PayloadCreateRequest, session: SessionDep, response: Response
+    request: PayloadCreateRequest,
+    session: SessionDep,
+    transformer: TransformerDep,
+    response: Response,
 ) -> PayloadCreateResponse:
-    payload, created = await get_or_create_payload(session, request.list_1, request.list_2)
+    payload, created = await get_or_create_payload(
+        session, transformer, request.list_1, request.list_2
+    )
     if created:
         return PayloadCreateResponse(id=payload.id, message="Payload created", reused=False)
 

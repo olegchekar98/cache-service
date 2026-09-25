@@ -1,6 +1,10 @@
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncEngine
+
+from cache_service import api
+from cache_service.schemas import MAX_STRING_LENGTH
 
 
 def test_create_app_uses_the_engine_it_was_given(app: FastAPI, engine: AsyncEngine) -> None:
@@ -12,6 +16,27 @@ def test_health(client: TestClient) -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_ready_when_the_database_answers(client: TestClient) -> None:
+    response = client.get("/ready")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_not_ready_when_the_database_is_unreachable(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def unreachable(_: AsyncEngine) -> bool:
+        return False
+
+    monkeypatch.setattr(api, "is_reachable", unreachable)
+
+    response = client.get("/ready")
+
+    assert response.status_code == 503
+    assert client.get("/health").status_code == 200, "liveness does not depend on the database"
 
 
 def test_create_then_read_returns_the_interleaved_payload(
@@ -74,6 +99,15 @@ def test_rejects_empty_lists(client: TestClient) -> None:
     response = client.post("/payload", json={"list_1": [], "list_2": []})
 
     assert response.status_code == 422
+
+
+def test_rejects_an_overlong_string(client: TestClient) -> None:
+    too_long = "x" * (MAX_STRING_LENGTH + 1)
+
+    response = client.post("/payload", json={"list_1": [too_long], "list_2": ["b"]})
+
+    assert response.status_code == 422
+    assert f"at most {MAX_STRING_LENGTH} characters" in response.text
 
 
 def test_rejects_a_missing_list(client: TestClient) -> None:

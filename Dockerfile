@@ -6,9 +6,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# Pinned dependencies first, so this layer is cached across source changes.
+COPY requirements.lock ./
+RUN pip install --no-cache-dir -r requirements.lock
+
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN pip install --no-cache-dir ".[postgres]"
+RUN pip install --no-cache-dir --no-deps .
 
 # The default SQLite database lives on a volume so it survives container restarts.
 ENV CACHE_SERVICE_DATABASE_URL=sqlite+aiosqlite:////data/cache_service.db
@@ -17,7 +21,8 @@ USER app
 
 EXPOSE 8000
 
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+# Readiness includes the database, so an unreachable database marks the container unhealthy.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=15s \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')"
 
-CMD ["uvicorn", "cache_service.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "--factory", "cache_service.main:create_app", "--host", "0.0.0.0", "--port", "8000"]
