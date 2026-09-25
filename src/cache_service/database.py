@@ -4,9 +4,9 @@ The engine lives on the FastAPI app (``app.state.engine``), not as a module
 global. Lifespan and ``get_session`` then use the bind ``create_app`` was given.
 """
 
+import asyncio
 import logging
 import time
-from asyncio import sleep
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -17,9 +17,26 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+try:
+    from asyncpg import PostgresError
+except ImportError:  # asyncpg is only installed with the postgres extra
+    _SERVER_ERRORS: tuple[type[Exception], ...] = ()
+else:
+    # SQLAlchemy does not translate errors asyncpg raises while connecting, such as
+    # "the database system is starting up", into its own exception types.
+    _SERVER_ERRORS = (PostgresError,)
+
+# asyncpg raises plain OSError while the host is unreachable, and TimeoutError
+# (an OSError) when it does not answer.
+_UNREACHABLE: tuple[type[Exception], ...] = (OperationalError, OSError, *_SERVER_ERRORS)
+_READY_CHECK_FAILURES: tuple[type[Exception], ...] = (DBAPIError, *_UNREACHABLE)
+
 logger = logging.getLogger(__name__)
 
 _RETRY_INTERVAL_SECONDS = 0.5
+# Below the container health check's 3 s timeout, and far below asyncpg's 60 s
+# connect timeout, so an unresponsive host cannot pile up hanging checks.
+_READY_TIMEOUT_SECONDS = 2.0
 
 
 def build_engine(url: str, **options: Any) -> AsyncEngine:
@@ -42,22 +59,26 @@ async def init_db(engine: AsyncEngine, timeout_seconds: float) -> None:
             async with engine.begin() as connection:
                 await connection.run_sync(SQLModel.metadata.create_all)
             return
-        # asyncpg raises plain OSError while the host is still unreachable.
-        except (OperationalError, OSError):
+        except _UNREACHABLE as error:
             if time.monotonic() >= deadline:
                 raise
-            logger.warning("database is not reachable yet, retrying")
-            await sleep(_RETRY_INTERVAL_SECONDS)
+            logger.warning("database is not reachable yet, retrying: %s", _describe(error))
+            await asyncio.sleep(_RETRY_INTERVAL_SECONDS)
 
 
 async def is_reachable(engine: AsyncEngine) -> bool:
     try:
-        async with engine.connect() as connection:
+        async with asyncio.timeout(_READY_TIMEOUT_SECONDS), engine.connect() as connection:
             await connection.execute(text("SELECT 1"))
-    except (DBAPIError, OSError):
-        logger.warning("readiness check could not reach the database", exc_info=True)
+    except _READY_CHECK_FAILURES as error:
+        # One line per failed check: the health check repeats it every 30 seconds.
+        logger.warning("readiness check failed: %s", _describe(error))
         return False
     return True
+
+
+def _describe(error: Exception) -> str:
+    return f"{type(error).__name__}: {error}" if str(error) else type(error).__name__
 
 
 async def get_session(request: Request) -> AsyncGenerator[AsyncSession, None]:

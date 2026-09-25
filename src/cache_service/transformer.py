@@ -35,12 +35,21 @@ class TransformerClient:
         self._calls: dict[str, _SharedCall] = {}
 
     async def transform_many(self, values: Sequence[str]) -> dict[str, str]:
-        """Transform every distinct value; if one call fails, the others are cancelled."""
-        async with asyncio.TaskGroup() as group:
-            tasks = {
-                value: group.create_task(self._transform_shared(value))
-                for value in dict.fromkeys(values)
-            }
+        """Transform every distinct value; if one call fails, the others are cancelled.
+
+        A single failure is raised as itself rather than wrapped in the
+        ExceptionGroup that TaskGroup raises, so callers can catch its type.
+        """
+        try:
+            async with asyncio.TaskGroup() as group:
+                tasks = {
+                    value: group.create_task(self._transform_shared(value))
+                    for value in dict.fromkeys(values)
+                }
+        except ExceptionGroup as failures:
+            if len(failures.exceptions) == 1:
+                raise failures.exceptions[0] from None
+            raise
         return {value: task.result() for value, task in tasks.items()}
 
     async def _transform_shared(self, value: str) -> str:

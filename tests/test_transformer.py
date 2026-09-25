@@ -97,13 +97,22 @@ async def test_a_failure_cancels_the_other_calls(service: FakeService) -> None:
     service.failing.add("bad")
     client = TransformerClient(max_concurrency=10)
 
-    with pytest.raises(ExceptionGroup) as raised:
+    with pytest.raises(RuntimeError, match="rejected bad"):
         await client.transform_many(["slow", "bad"])
 
-    assert raised.group_contains(RuntimeError, match="rejected bad")
     await _settle()
     assert service.in_flight == 0, "the slow call must be cancelled, not left running"
     assert service.finished == []
+
+
+async def test_simultaneous_failures_are_all_reported(service: FakeService) -> None:
+    service.failing.update({"bad", "worse"})
+    client = TransformerClient(max_concurrency=10)
+
+    with pytest.raises(ExceptionGroup) as raised:
+        await client.transform_many(["bad", "worse"])
+
+    assert len(raised.value.exceptions) == 2
 
 
 async def test_a_departing_waiter_leaves_the_shared_call_running(service: FakeService) -> None:

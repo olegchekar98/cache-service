@@ -73,6 +73,11 @@ strict = true
 plugins = []
 
 [[tool.mypy.overrides]]
+# asyncpg ships without type information.
+module = "asyncpg.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 # SQLModel's table models are dynamically typed at the SQLAlchemy boundary.
 module = "cache_service.models"
 disallow_untyped_calls = false

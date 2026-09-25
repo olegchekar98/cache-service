@@ -1,5 +1,6 @@
 import asyncio
 import itertools
+from collections.abc import Sequence
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -118,27 +119,57 @@ async def test_a_losing_request_adopts_the_stored_identifier(
     assert not created
 
 
+class WaitingClient(TransformerClient):
+    """Counts the requests that have reached the transformer."""
+
+    def __init__(self) -> None:
+        super().__init__(max_concurrency=1_000)
+        self.waiting = 0
+
+    async def transform_many(self, values: Sequence[str]) -> dict[str, str]:
+        self.waiting += 1
+        return await super().transform_many(values)
+
+
 @requires_server_database
 async def test_concurrent_identical_requests_settle_on_one_identifier(
-    engine: AsyncEngine, transformer_calls: list[str]
+    engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Real concurrency: independent sessions, one transformer client per process.
 
-    The delay keeps the calls in flight long enough for the requests to overlap,
-    which is when they share them.
+    Calls are held open until every request waits on them, so the requests overlap
+    however slowly their connections open.
     """
-    transformer = TransformerClient(max_concurrency=100, latency_seconds=0.05)
+    requests = 5
     list_1 = [f"left {index}" for index in range(50)]
     list_2 = [f"right {index}" for index in range(50)]
+    calls: list[str] = []
+    release = asyncio.Event()
+
+    async def held_transform(value: str, latency_seconds: float = 0.0) -> str:
+        calls.append(value)
+        await release.wait()
+        return value.upper()
+
+    monkeypatch.setattr(transformer_module, "transform", held_transform)
+    transformer = WaitingClient()
 
     async def request() -> tuple[str, bool]:
         async with AsyncSession(engine, expire_on_commit=False) as session:
             payload, created = await get_or_create_payload(session, transformer, list_1, list_2)
             return payload.id, created
 
-    results = await asyncio.gather(*(request() for _ in range(5)))
+    pending = asyncio.gather(*(request() for _ in range(requests)))
+    async with asyncio.timeout(10):
+        while transformer.waiting < requests or len(calls) < len(list_1) + len(list_2):
+            await asyncio.sleep(0.01)
+    # The last request's tasks are created but join their shared calls on the next turns.
+    for _ in range(3):
+        await asyncio.sleep(0)
+    release.set()
+    results = await pending
 
     assert len({identifier for identifier, _ in results}) == 1
     assert sum(created for _, created in results) == 1
-    assert sorted(transformer_calls) == sorted(list_1 + list_2), "each string once in total"
+    assert sorted(calls) == sorted(list_1 + list_2), "each string once across all requests"
     await engine.dispose()
