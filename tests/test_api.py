@@ -1,9 +1,9 @@
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 
-def test_create_app_uses_the_engine_it_was_given(app: FastAPI, engine: Engine) -> None:
+def test_create_app_uses_the_engine_it_was_given(app: FastAPI, engine: AsyncEngine) -> None:
     assert app.state.engine is engine
 
 

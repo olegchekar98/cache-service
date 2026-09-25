@@ -1,17 +1,20 @@
-from unittest.mock import MagicMock
-
 import pytest
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import AsyncEngine
 from sqlmodel import SQLModel
 
 from cache_service import database
 from cache_service.config import settings
 
 
-def test_init_db_waits_for_an_unreachable_database(monkeypatch: pytest.MonkeyPatch) -> None:
+# `session` disposes of the engine once the test is done.
+@pytest.mark.usefixtures("session")
+async def test_init_db_waits_for_an_unreachable_database(
+    engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A database that is still starting up must not crash the service."""
     monkeypatch.setattr(settings, "database_startup_timeout_seconds", 5)
-    monkeypatch.setattr("cache_service.database.time.sleep", lambda _: None)
+    monkeypatch.setattr(database, "_RETRY_INTERVAL_SECONDS", 0)
     attempts = 0
 
     def fail_once(*_: object, **__: object) -> None:
@@ -22,18 +25,21 @@ def test_init_db_waits_for_an_unreachable_database(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(SQLModel.metadata, "create_all", fail_once)
 
-    database.init_db(MagicMock())
+    await database.init_db(engine)
 
     assert attempts == 2
 
 
-def test_init_db_gives_up_once_the_timeout_passes(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.usefixtures("session")
+async def test_init_db_gives_up_once_the_timeout_passes(
+    engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setattr(settings, "database_startup_timeout_seconds", 0)
 
     def always_fail(*_: object, **__: object) -> None:
-        raise OperationalError("SELECT 1", {}, Exception("connection refused"))
+        raise OSError("connection refused")
 
     monkeypatch.setattr(SQLModel.metadata, "create_all", always_fail)
 
-    with pytest.raises(OperationalError):
-        database.init_db(MagicMock())
+    with pytest.raises(OSError, match="connection refused"):
+        await database.init_db(engine)

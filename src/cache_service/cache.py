@@ -1,11 +1,14 @@
 """Persistent cache in front of the transformer service."""
 
+import asyncio
 import logging
 from collections.abc import Iterator, Sequence
 
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import Session, col, select
+from sqlmodel import col, select
+from sqlmodel.ext.asyncio.session import AsyncSession
 
+from cache_service.config import settings
 from cache_service.hashing import digest_text
 from cache_service.models import TransformCache
 from cache_service.transformer import transform
@@ -17,7 +20,7 @@ logger = logging.getLogger(__name__)
 _LOOKUP_CHUNK_SIZE = 500
 
 
-def transform_all(session: Session, values: Sequence[str]) -> dict[str, str]:
+async def transform_all(session: AsyncSession, values: Sequence[str]) -> dict[str, str]:
     """Return the transformed text for every value, keyed by the original string.
 
     The transformer is called once per distinct value that is not already
@@ -25,26 +28,27 @@ def transform_all(session: Session, values: Sequence[str]) -> dict[str, str]:
     the cache insert, not the caller's payload transaction.
     """
     digests = {value: digest_text(value) for value in dict.fromkeys(values)}
-    results = _load_cached(session, digests)
+    results = await _load_cached(session, digests)
     missing = [value for value in digests if value not in results]
     if missing:
-        results.update(_transform_and_cache(session, missing, digests))
+        results.update(await _transform_and_cache(session, missing, digests))
     logger.debug(
         "%d distinct values, %d served from cache", len(digests), len(results) - len(missing)
     )
     return results
 
 
-def _load_cached(session: Session, digests: dict[str, str]) -> dict[str, str]:
+async def _load_cached(session: AsyncSession, digests: dict[str, str]) -> dict[str, str]:
     by_digest: dict[str, str] = {}
     for chunk in _chunked(list(digests.values()), _LOOKUP_CHUNK_SIZE):
         statement = select(TransformCache).where(col(TransformCache.source_digest).in_(chunk))
-        by_digest.update({row.source_digest: row.transformed for row in session.exec(statement)})
+        rows = await session.exec(statement)
+        by_digest.update({row.source_digest: row.transformed for row in rows})
     return {value: by_digest[digest] for value, digest in digests.items() if digest in by_digest}
 
 
-def _transform_and_cache(
-    session: Session, values: Sequence[str], digests: dict[str, str]
+async def _transform_and_cache(
+    session: AsyncSession, values: Sequence[str], digests: dict[str, str]
 ) -> dict[str, str]:
     """Persist transformer results, retrying only the rows that are still missing.
 
@@ -52,14 +56,10 @@ def _transform_and_cache(
     conflict the savepoint is rolled back, the winner's rows are re-read, and
     only the leftovers are inserted — without calling the transformer again.
     """
-    results: dict[str, str] = {}
+    results = await _transform_concurrently(values)
     pending = list(values)
 
     while pending:
-        for value in pending:
-            if value not in results:
-                results[value] = transform(value)
-
         try:
             # begin_nested is a SAVEPOINT: failure here must not session.rollback()
             # the caller's payload work sitting in the same session. flush(rows)
@@ -73,11 +73,11 @@ def _transform_and_cache(
                 )
                 for value in pending
             ]
-            with session.begin_nested():
+            async with session.begin_nested():
                 session.add_all(rows)
-                session.flush(rows)
+                await session.flush(rows)
         except IntegrityError:
-            cached = _load_cached(session, {value: digests[value] for value in pending})
+            cached = await _load_cached(session, {value: digests[value] for value in pending})
             remaining = [value for value in pending if value not in cached]
             if len(remaining) == len(pending):
                 # The conflict was not one of our keys; retrying would loop forever.
@@ -89,6 +89,18 @@ def _transform_and_cache(
         break
 
     return results
+
+
+async def _transform_concurrently(values: Sequence[str]) -> dict[str, str]:
+    """Call the transformer for every value, keeping a bounded number in flight."""
+    limit = asyncio.Semaphore(settings.transformer_max_concurrency)
+
+    async def transform_one(value: str) -> str:
+        async with limit:
+            return await transform(value)
+
+    transformed = await asyncio.gather(*(transform_one(value) for value in values))
+    return dict(zip(values, transformed, strict=True))
 
 
 def _chunked(values: list[str], size: int) -> Iterator[list[str]]:

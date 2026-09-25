@@ -13,7 +13,7 @@ POST /payload ──► digest(list_1, list_2) ──► payload exists? ──y
                                                   ▼
                                     transform_all(distinct strings)
                                       ├─ cached in transform_cache ──► reuse
-                                      └─ missing ──► transformer ──► store
+                                      └─ missing ──► transformer (concurrent) ──► store
                                                   │
                                                   ▼
                                     interleave, store payload, return identifier
@@ -27,7 +27,9 @@ Two levels of caching satisfy the "minimize calls to the transformer" requiremen
 | `transform_cache` | SHA-256 of a single input string | A new payload only pays for strings that have never been seen, in any request or list |
 
 Within one request, duplicate strings are collapsed before lookup, and the remaining
-strings are resolved with a single batched query rather than one query per string.
+strings are resolved with a single batched query rather than one query per string. Strings
+that are not cached go to the transformer concurrently, up to
+`CACHE_SERVICE_TRANSFORMER_MAX_CONCURRENCY` calls at a time.
 
 | Module | Responsibility |
 |--------|----------------|
@@ -57,7 +59,7 @@ docker compose up --build                   # SQLite on a named volume
 To run against PostgreSQL instead:
 
 ```bash
-CACHE_SERVICE_DATABASE_URL=postgresql+psycopg://cache:cache@postgres:5432/cache \
+CACHE_SERVICE_DATABASE_URL=postgresql+asyncpg://cache:cache@postgres:5432/cache \
   docker compose --profile postgres up --build
 ```
 
@@ -123,15 +125,16 @@ cat sample_input.json | cache-cli --input - --output report.json
 ```
 
 The report records each iteration, which makes the caching visible from the command line —
-here with the transformer slowed to 200 ms per string:
+here with the transformer slowed to 200 ms per string. The four strings of the first
+request are transformed concurrently, so it takes about one transformer delay:
 
 ```json
 {
   "host": "http://localhost:8000/",
   "iterations": [
-    {"payload_id": "438e2cdd-…", "reused": false, "elapsed_seconds": 0.8448},
-    {"payload_id": "438e2cdd-…", "reused": true,  "elapsed_seconds": 0.004563},
-    {"payload_id": "438e2cdd-…", "reused": true,  "elapsed_seconds": 0.004347}
+    {"payload_id": "3f74ab9b-…", "reused": false, "elapsed_seconds": 0.223461},
+    {"payload_id": "3f74ab9b-…", "reused": true,  "elapsed_seconds": 0.00417},
+    {"payload_id": "3f74ab9b-…", "reused": true,  "elapsed_seconds": 0.002286}
   ],
   "output": "ALPHA, GAMMA, BETA, DELTA"
 }
@@ -143,10 +146,11 @@ Exit codes: `0` success, `1` the request failed, `2` invalid arguments or input.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CACHE_SERVICE_DATABASE_URL` | `sqlite:///./cache_service.db` | SQLAlchemy database URL |
+| `CACHE_SERVICE_DATABASE_URL` | `sqlite+aiosqlite:///./cache_service.db` | SQLAlchemy URL with an async driver (`sqlite+aiosqlite` or `postgresql+asyncpg`) |
 | `CACHE_SERVICE_LOG_LEVEL` | `INFO` | Root log level |
 | `CACHE_SERVICE_DATABASE_STARTUP_TIMEOUT_SECONDS` | `10` | How long to wait at startup for the database to accept connections |
 | `CACHE_SERVICE_TRANSFORMER_LATENCY_SECONDS` | `0` | Artificial delay per transformer call |
+| `CACHE_SERVICE_TRANSFORMER_MAX_CONCURRENCY` | `10` | Transformer calls in flight per request |
 
 ## Development
 
@@ -162,6 +166,13 @@ The suite separates unit tests (`test_hashing`, `test_transformer`, `test_cache`
 CLI end to end against it (`test_cli`). A `transformer_calls` fixture records every call to
 the transformer, so the caching requirements are asserted directly rather than inferred.
 
+The suite runs on in-memory SQLite by default. Point it at PostgreSQL to cover transaction
+isolation too; the schema is reset before every test:
+
+```bash
+CACHE_SERVICE_TEST_DATABASE_URL=postgresql+asyncpg://cache:cache@localhost:5432/cache make test
+```
+
 ## Design notes and trade-offs
 
 - **Payload identity is content-based.** The identifier is a UUID, but it is looked up by a
@@ -171,8 +182,11 @@ the transformer, so the caching requirements are asserted directly rather than i
   session, so a unique conflict must roll back only the cache insert; `session.rollback()`
   would also discard the caller's pending payload work. When the savepoint commits
   differs by database: on PostgreSQL the cache rows commit together with the payload, but
-  on SQLite the `pysqlite` driver only opens a transaction at the first write, so releasing
-  the savepoint commits the cache rows immediately. See the known limitations below.
+  on SQLite the `sqlite3` driver only opens a transaction at the first write, so releasing
+  the savepoint commits the cache rows immediately. SQLAlchemy documents a workaround that
+  emits `BEGIN` up front; it was tried and rejected, because every request reads before
+  it writes, and under parallel load SQLite then fails the upgrade to a write lock with
+  `database is locked` instead of waiting.
 - **Concurrent duplicates are resolved by the database.** Both writes are guarded by unique
   constraints. A loser of a payload race rolls back and adopts the committed identifier.
   A loser of a cache race re-reads the winner's rows and inserts only the values that are
@@ -182,8 +196,12 @@ the transformer, so the caching requirements are asserted directly rather than i
   patching `get_session` around a module-level engine created at import time.
 - **Startup waits for the database** rather than relying on container ordering, so the
   PostgreSQL profile works without a `depends_on` health gate.
-- **Endpoints are synchronous** because the database layer is synchronous. FastAPI runs them
-  in a worker thread, which avoids blocking the event loop on database I/O.
+- **The service is async end to end:** handlers, `AsyncSession`, the `aiosqlite` and
+  `asyncpg` drivers, and the transformer client. A request waiting on the database or the
+  transformer does not occupy a thread, and the strings of one request are transformed
+  concurrently: 40 new strings at 200 ms each take about 0.8 s instead of 8 s. Sessions use
+  `expire_on_commit=False`, because an async session cannot lazily reload expired
+  attributes.
 - **Shortcuts taken,** reasonable for an exercise but worth flagging for production:
   - Tables are created at startup instead of through Alembic migrations.
   - Cache entries never expire; the transformer is assumed to be pure and stable. A real
@@ -197,9 +215,9 @@ the transformer, so the caching requirements are asserted directly rather than i
   - The transformer is called while the request's database transaction is open. With a
     slow remote service, that holds a pooled connection for the duration of the call.
   - The savepoint's commit timing differs between SQLite and PostgreSQL (see above).
-    SQLAlchemy documents a `pysqlite` workaround that makes SQLite match.
-  - Tests run on a single in-memory SQLite connection, so they cannot observe transaction
-    isolation, and PostgreSQL is not covered by the suite.
+  - The default test run uses one in-memory SQLite connection, so it cannot observe
+    transaction isolation. The PostgreSQL run that covers it is opt-in, and there is no CI
+    to run it automatically.
 - **Two ambiguities in the specification** were resolved as follows:
   - `-h` cannot mean both `--host` and `--help`; it is left as `--help` (the convention
     every CLI user expects), so `--host` has no short form.

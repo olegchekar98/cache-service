@@ -11,7 +11,7 @@ COPY src ./src
 RUN pip install --no-cache-dir ".[postgres]"
 
 # The default SQLite database lives on a volume so it survives container restarts.
-ENV CACHE_SERVICE_DATABASE_URL=sqlite:////data/cache_service.db
+ENV CACHE_SERVICE_DATABASE_URL=sqlite+aiosqlite:////data/cache_service.db
 RUN useradd --create-home --uid 1000 app && mkdir /data && chown app /data
 USER app
 

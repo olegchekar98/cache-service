@@ -6,12 +6,15 @@ global. Lifespan and ``get_session`` then use the bind ``create_app`` was given.
 
 import logging
 import time
-from collections.abc import Generator
+from asyncio import sleep
+from collections.abc import AsyncGenerator
+from typing import Any
 
 from fastapi import Request
-from sqlalchemy import Engine
 from sqlalchemy.exc import OperationalError
-from sqlmodel import Session, SQLModel, create_engine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlmodel import SQLModel
+from sqlmodel.ext.asyncio.session import AsyncSession
 
 from cache_service.config import settings
 
@@ -20,14 +23,15 @@ logger = logging.getLogger(__name__)
 _RETRY_INTERVAL_SECONDS = 0.5
 
 
-def build_engine(url: str) -> Engine:
-    # SQLite binds a connection to the thread that created it, which breaks the
-    # threadpool FastAPI uses to run synchronous endpoints.
-    connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
-    return create_engine(url, connect_args=connect_args)
+def build_engine(url: str, **options: Any) -> AsyncEngine:
+    # SQLite keeps the driver's deferred BEGIN on purpose. Emitting BEGIN up front
+    # would make savepoints nest as on PostgreSQL, but every request reads before
+    # it writes, and SQLite fails such a read-to-write upgrade under contention
+    # with "database is locked" instead of waiting for the lock.
+    return create_async_engine(url, **options)
 
 
-def init_db(engine: Engine) -> None:
+async def init_db(engine: AsyncEngine) -> None:
     """Create missing tables, waiting for the database to become reachable.
 
     Creating tables on startup is adequate for an append-only schema; a
@@ -36,15 +40,19 @@ def init_db(engine: Engine) -> None:
     deadline = time.monotonic() + settings.database_startup_timeout_seconds
     while True:
         try:
-            SQLModel.metadata.create_all(engine)
+            async with engine.begin() as connection:
+                await connection.run_sync(SQLModel.metadata.create_all)
             return
-        except OperationalError:
+        # asyncpg raises plain OSError while the host is still unreachable.
+        except (OperationalError, OSError):
             if time.monotonic() >= deadline:
                 raise
             logger.warning("database is not reachable yet, retrying")
-            time.sleep(_RETRY_INTERVAL_SECONDS)
+            await sleep(_RETRY_INTERVAL_SECONDS)
 
 
-def get_session(request: Request) -> Generator[Session, None, None]:
-    with Session(request.app.state.engine) as session:
+async def get_session(request: Request) -> AsyncGenerator[AsyncSession, None]:
+    # Expiring on commit would make every later attribute access a lazy load,
+    # which async sessions cannot perform implicitly.
+    async with AsyncSession(request.app.state.engine, expire_on_commit=False) as session:
         yield session

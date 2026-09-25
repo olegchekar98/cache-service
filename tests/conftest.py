@@ -2,26 +2,33 @@
 
 Tests pass their engine into ``create_app``, so lifespan, handlers and the
 transformer cache all use the same bind. StaticPool keeps every connection on
-one in-memory database, which FastAPI's worker threads need for SQLite.
+one in-memory database.
+
+The API client runs the app on its own event loop, so API tests let the app's
+lifespan create the tables; ``session`` creates them on the test's loop instead.
 """
 
+import asyncio
 import os
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 
 # Force these: setdefault would keep a developer shell's non-zero transformer delay
-# and make the large-batch test look hung (1000 * 200ms).
-os.environ["CACHE_SERVICE_DATABASE_URL"] = "sqlite://"
+# and make the large-batch test look hung.
+os.environ["CACHE_SERVICE_DATABASE_URL"] = "sqlite+aiosqlite://"
 os.environ["CACHE_SERVICE_TRANSFORMER_LATENCY_SECONDS"] = "0"
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine
-from sqlmodel import Session, SQLModel, create_engine
+from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.pool import NullPool
+from sqlmodel import SQLModel
+from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlmodel.pool import StaticPool
 
 from cache_service import cache
 from cache_service.config import settings
+from cache_service.database import build_engine
 from cache_service.main import create_app
 from cache_service.transformer import transform
 
@@ -46,25 +53,37 @@ def sample_output() -> str:
 
 
 @pytest.fixture
-def engine() -> Iterator[Engine]:
-    engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    SQLModel.metadata.create_all(engine)
-    yield engine
-    engine.dispose()
+def engine() -> AsyncEngine:
+    """An in-memory SQLite engine, or ``CACHE_SERVICE_TEST_DATABASE_URL`` when set.
+
+    A server database is reset per test. NullPool keeps connections from being
+    shared between the event loops of the test and of the API client.
+    """
+    url = os.environ.get("CACHE_SERVICE_TEST_DATABASE_URL")
+    if url is None:
+        return build_engine("sqlite+aiosqlite://", poolclass=StaticPool)
+    engine = build_engine(url, poolclass=NullPool)
+    asyncio.run(_reset_schema(engine))
+    return engine
+
+
+async def _reset_schema(engine: AsyncEngine) -> None:
+    async with engine.begin() as connection:
+        await connection.run_sync(SQLModel.metadata.drop_all)
+        await connection.run_sync(SQLModel.metadata.create_all)
 
 
 @pytest.fixture
-def session(engine: Engine) -> Iterator[Session]:
-    with Session(engine) as session:
+async def session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
+    async with engine.begin() as connection:
+        await connection.run_sync(SQLModel.metadata.create_all)
+    async with AsyncSession(engine, expire_on_commit=False) as session:
         yield session
+    await engine.dispose()
 
 
 @pytest.fixture
-def app(engine: Engine) -> FastAPI:
+def app(engine: AsyncEngine) -> FastAPI:
     return create_app(engine=engine)
 
 
@@ -84,9 +103,9 @@ def transformer_calls(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     """Record every transformer invocation so cache behaviour can be asserted."""
     calls: list[str] = []
 
-    def recording_transform(value: str) -> str:
+    async def recording_transform(value: str) -> str:
         calls.append(value)
-        return transform(value)
+        return await transform(value)
 
     monkeypatch.setattr(cache, "transform", recording_transform)
     return calls
