@@ -11,12 +11,15 @@ string already stored in `transform_cache` is never sent to the transformer agai
 POST /payload ──► digest(list_1, list_2) ──► payload exists? ──yes──► return stored identifier
                                                   │no
                                                   ▼
-                                    transform_all(distinct strings)
-                                      ├─ cached in transform_cache ──► reuse
-                                      └─ missing ──► transformer (concurrent) ──► store
+                               read phase: look up the distinct strings in transform_cache,
+                                           then end the transaction (connection released)
                                                   │
                                                   ▼
-                                    interleave, store payload, return identifier
+                               transformer: only the missing strings, concurrently,
+                                            sharing calls with other in-flight requests
+                                                  │
+                                                  ▼
+                               write phase: store results (savepoint), store payload, commit
 ```
 
 Two levels of caching satisfy the "minimize calls to the transformer" requirement:
@@ -28,25 +31,30 @@ Two levels of caching satisfy the "minimize calls to the transformer" requiremen
 
 Within one request, duplicate strings are collapsed before lookup, and the remaining
 strings are resolved with a single batched query rather than one query per string. Strings
-that are not cached go to the transformer concurrently, up to
-`CACHE_SERVICE_TRANSFORMER_MAX_CONCURRENCY` calls at a time.
+that are not cached go to the transformer concurrently. At most
+`CACHE_SERVICE_TRANSFORMER_MAX_CONCURRENCY` calls are in flight across the whole process,
+and concurrent requests that need the same string share one call.
 
 | Module | Responsibility |
 |--------|----------------|
-| `api.py` | HTTP endpoints and status codes |
-| `payloads.py` | Payload identity, interleaving, deduplication |
-| `cache.py` | Transformer cache: batched lookup, write, race handling |
-| `transformer.py` | The simulated external service |
+| `api.py` | HTTP endpoints, status codes, liveness and readiness |
+| `payloads.py` | Payload identity, interleaving, the read / transform / write phases |
+| `cache.py` | Transformer cache: batched lookup, ordered write, race handling |
+| `transformer.py` | The simulated external service, and the client that limits and shares calls |
 | `models.py` / `database.py` | Tables, engine, session lifecycle |
+| `main.py` | `create_app` factory: settings, engine and transformer client per app |
 | `cli.py` | `cache-cli` client |
 
 ## Quick start
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-uvicorn cache_service.main:app --reload
+make install        # pinned versions from requirements-dev.lock
+make run            # uvicorn --factory cache_service.main:create_app --reload
 ```
+
+The app is built by a factory, so importing the package reads no settings and creates
+no engine.
 
 Interactive API documentation is served at `http://localhost:8000/docs`.
 
@@ -84,8 +92,10 @@ curl -X POST http://localhost:8000/payload \
 Returns `201 Created` for a new payload. An identical request returns `200 OK` with the
 same identifier and `"reused": true`, because nothing was created.
 
-Both lists must be non-empty, of equal length, and at most 1000 items; violations return
-`422` with a description of the problem.
+Both lists must be non-empty, of equal length, and at most 1000 items, and each string
+at most 1000 characters; violations return `422` with a description of the problem. The
+specification sets no limits; these bound the memory, storage and transformer work one
+request can cause.
 
 ### `GET /payload/{id}`
 
@@ -101,9 +111,11 @@ curl http://localhost:8000/payload/88adbd61-2cd7-4b00-a24f-ff32b3b2424d
 
 Unknown identifiers return `404`.
 
-### `GET /health`
+### `GET /health` and `GET /ready`
 
-Returns `{"status": "ok"}`; used as the container health check.
+`/health` is liveness: it returns `{"status": "ok"}` whenever the process serves requests.
+`/ready` also checks that the database accepts connections and returns `503` otherwise; the
+container health check uses it.
 
 ## CLI
 
@@ -150,7 +162,7 @@ Exit codes: `0` success, `1` the request failed, `2` invalid arguments or input.
 | `CACHE_SERVICE_LOG_LEVEL` | `INFO` | Root log level |
 | `CACHE_SERVICE_DATABASE_STARTUP_TIMEOUT_SECONDS` | `10` | How long to wait at startup for the database to accept connections |
 | `CACHE_SERVICE_TRANSFORMER_LATENCY_SECONDS` | `0` | Artificial delay per transformer call |
-| `CACHE_SERVICE_TRANSFORMER_MAX_CONCURRENCY` | `10` | Transformer calls in flight per request |
+| `CACHE_SERVICE_TRANSFORMER_MAX_CONCURRENCY` | `10` | Transformer calls in flight across the process |
 
 ## Development
 
@@ -173,14 +185,27 @@ isolation too; the schema is reset before every test:
 CACHE_SERVICE_TEST_DATABASE_URL=postgresql+asyncpg://cache:cache@localhost:5432/cache make test
 ```
 
+Three tests only run there: savepoint isolation, two writers storing the same strings in
+opposite orders, and concurrent identical requests on independent sessions.
+
+CI (`.github/workflows/ci.yml`) runs lint, type checks and the suite on SQLite, the suite
+again on PostgreSQL, and builds the image and waits for `/ready`. Dependencies are pinned
+in `requirements.lock` (the image) and `requirements-dev.lock` (development and CI);
+`make lock` regenerates both after `pyproject.toml` changes.
+
 ## Design notes and trade-offs
 
 - **Payload identity is content-based.** The identifier is a UUID, but it is looked up by a
   digest of the inputs, so the same request always maps to the same identifier. Digests are
   stored instead of raw strings as keys, which keeps index entries small and bounded.
-- **Cache writes use a savepoint, not `session.commit()`.** The cache shares the request's
-  session, so a unique conflict must roll back only the cache insert; `session.rollback()`
-  would also discard the caller's pending payload work. When the savepoint commits
+- **A request works in three phases.** It reads the payload and cache rows, ends that
+  read-only transaction, calls the transformer with no connection held, and then writes
+  cache rows and payload in one short transaction. A slow transformer therefore does not
+  keep pooled connections idle in a transaction.
+- **The cache never commits or rolls back.** `load_cached` and `store` run inside the
+  caller's transaction, and only `payloads.py`, which owns the unit of work, ends it.
+- **Cache writes use a savepoint.** A unique conflict must roll back only the cache insert;
+  `session.rollback()` would also discard the caller's pending payload work. When the savepoint commits
   differs by database: on PostgreSQL the cache rows commit together with the payload, but
   on SQLite the `sqlite3` driver only opens a transaction at the first write, so releasing
   the savepoint commits the cache rows immediately. SQLAlchemy documents a workaround that
@@ -189,11 +214,20 @@ CACHE_SERVICE_TEST_DATABASE_URL=postgresql+asyncpg://cache:cache@localhost:5432/
   `database is locked` instead of waiting.
 - **Concurrent duplicates are resolved by the database.** Both writes are guarded by unique
   constraints. A loser of a payload race rolls back and adopts the committed identifier.
-  A loser of a cache race re-reads the winner's rows and inserts only the values that are
-  still missing, without calling the transformer again for them.
-- **The app owns the engine.** `create_app(engine=...)` stores it on `app.state`, so the
-  lifespan and `get_session` use the same database. Tests pass their engine in rather than
-  patching `get_session` around a module-level engine created at import time.
+  A loser of a cache race re-reads the winner's rows, keeps them, and inserts only the
+  values that are still missing, without calling the transformer again for them.
+- **Cache rows are inserted in digest order.** On PostgreSQL an insert locks each new key
+  until the transaction ends. Two requests inserting the same new strings in different
+  orders used to deadlock, and one of them failed with a 500; a fixed order rules that out.
+- **Transformer calls are shared and limited per process.** `TransformerClient` lives on
+  the app. Concurrent requests that need the same string wait for one call, the limit
+  covers all requests together, and when one call fails the request's other calls are
+  cancelled rather than left running. A shared call is cancelled only when no request
+  waits for it any more.
+- **The app owns its settings and engine.** `create_app(settings, engine)` builds the
+  engine and transformer client from the settings it is given and stores them on
+  `app.state`, so the lifespan, `get_session` and the handlers all use the same ones.
+  Tests pass their own instead of patching module-level objects.
 - **Startup waits for the database** rather than relying on container ordering, so the
   PostgreSQL profile works without a `depends_on` health gate.
 - **The service is async end to end:** handlers, `AsyncSession`, the `aiosqlite` and
@@ -207,17 +241,13 @@ CACHE_SERVICE_TEST_DATABASE_URL=postgresql+asyncpg://cache:cache@localhost:5432/
   - Cache entries never expire; the transformer is assumed to be pure and stable. A real
     deployment would version the cache key with the transformer's version.
   - There is no authentication, rate limiting, or pagination over stored payloads.
-- **Known limitations,** found by testing and not yet fixed:
-  - Concurrent requests that miss the same string each call the transformer: the cache
-    stays correct, but the calls are duplicated. With 32 parallel clients sending 200
-    requests over 30 distinct strings, the transformer was called 160 times. A
-    single-flight guard around the transformer call would fix this.
-  - The transformer is called while the request's database transaction is open. With a
-    slow remote service, that holds a pooled connection for the duration of the call.
+- **Known limitations:**
+  - Calls are shared within one process. With several uvicorn workers or replicas, each
+    process may call the transformer for the same new string once; the unique constraint
+    keeps the cache correct.
+  - Requests only share a call while it is in flight. One that arrives just after a call
+    finished, but before its row was committed, calls the transformer again.
   - The savepoint's commit timing differs between SQLite and PostgreSQL (see above).
-  - The default test run uses one in-memory SQLite connection, so it cannot observe
-    transaction isolation. The PostgreSQL run that covers it is opt-in, and there is no CI
-    to run it automatically.
 - **Two ambiguities in the specification** were resolved as follows:
   - `-h` cannot mean both `--host` and `--help`; it is left as `--help` (the convention
     every CLI user expects), so `--host` has no short form.
